@@ -35,6 +35,7 @@
   (:import [backtype.storm.metric.api IMetric IMetricsConsumer$TaskInfo IMetricsConsumer$DataPoint StateMetric])
   (:import [backtype.storm Config Constants])
   (:import [java.util.concurrent ConcurrentLinkedQueue])
+  (:import [backtype.storm.messaging TaskMessage IContext IConnection ConnectionWithStatus ConnectionWithStatus$Status])
   (:require [backtype.storm [tuple :as tuple] [thrift :as thrift]
              [cluster :as cluster] [disruptor :as disruptor] [stats :as stats]])
   (:require [backtype.storm.daemon [task :as task]])
@@ -61,9 +62,28 @@
     (.chooseTasks grouping task-id values)
     ))
 
+(defn task->socket [task worker]
+  (let [task->node+port (:cached-task->node+port worker)
+        node+port->socket (:cached-node+port->socket worker)
+        node+port (get @task->node+port task)
+        ]
+    (get @node+port->socket node+port)
+    ))
+
+(defn is-alive-connection [^IConnection connection]
+  (if (instance?  ConnectionWithStatus connection)
+    (let [^ConnectionWithStatus connection connection
+          status (.status connection)]
+      (not (= status ConnectionWithStatus$Status/Closed)))
+    true))
+
+(defn filter-alive-tasks [target-tasks worker]
+  (filter #(is-alive-connection (task->socket % worker)) target-tasks)
+  )
+
 (defn- mk-grouper
   "Returns a function that returns a vector of which task indices to send tuple to, or just a single task index."
-  [^WorkerTopologyContext context component-id stream-id ^Fields out-fields thrift-grouping ^List target-tasks]
+  [^WorkerTopologyContext context component-id stream-id ^Fields out-fields thrift-grouping ^List target-tasks worker]
   (let [num-tasks (count target-tasks)
         random (Random.)
         target-tasks (vec (sort target-tasks))]
@@ -80,6 +100,8 @@
         (fn [task-id tuple] target-tasks)
       :shuffle
         (mk-shuffle-grouper target-tasks)
+      :alive-only-shuffle
+        (mk-shuffle-grouper (filter-alive-tasks target-tasks worker))
       :local-or-shuffle
         (let [same-tasks (set/intersection
                            (set target-tasks)
@@ -102,7 +124,7 @@
         :direct
       )))
 
-(defn- outbound-groupings [^WorkerTopologyContext worker-context this-component-id stream-id out-fields component->grouping]
+(defn- outbound-groupings [^WorkerTopologyContext worker-context this-component-id stream-id out-fields component->grouping worker]
   (->> component->grouping
        (filter-key #(-> worker-context
                         (.getComponentTasks %)
@@ -116,13 +138,14 @@
                             out-fields
                             tgrouping
                             (.getComponentTasks worker-context component)
-                            )]))
+                            worker
+                  )]))
        (into {})
        (HashMap.)))
 
 (defn outbound-components
   "Returns map of stream id to component id to grouper"
-  [^WorkerTopologyContext worker-context component-id]
+  [^WorkerTopologyContext worker-context component-id worker]
   (->> (.getTargets worker-context component-id)
         clojurify-structure
         (map (fn [[stream-id component->grouping]]
@@ -132,7 +155,9 @@
                   component-id
                   stream-id
                   (.getComponentOutputFields worker-context component-id stream-id)
-                  component->grouping)]))
+                  component->grouping
+                  worker
+                  )]))
          (into {})
          (HashMap.)))
 
@@ -249,7 +274,7 @@
      :stats (mk-executor-stats <> (sampling-rate storm-conf))
      :interval->task->metric-registry (HashMap.)
      :task->component (:task->component worker)
-     :stream->component->grouper (outbound-components worker-context component-id)
+     :stream->component->grouper (outbound-components worker-context component-id worker)
      :report-error (throttled-report-error-fn <>)
      :report-error-and-die (fn [error]
                              ((:report-error <>) error)
